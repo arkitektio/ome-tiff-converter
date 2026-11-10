@@ -20,6 +20,13 @@ and refuses what it cannot make:
   then makes one generic series of the file. That is paired with the document's Image
   only where there is one of each and their extents agree (`describes`).
 
+A TIFF with **no OME-XML at all** is read too (`read_images`): one image per tifffile
+series, with no OME Image behind it (`plain_images`). Nothing is invented for it. Axes
+tifffile cannot name (a multi-page file's ``I``, a shaped file's ``Q``) stay unnamed, and
+it is uncalibrated, except where ImageJ states a length unit (`imagej_calibration`). A
+baseline ``XResolution`` is not read as a calibration: it is a print resolution, and
+72 dpi would claim 353 µm pixels.
+
 The rest reads where and when each Image was taken from its ``Plane`` records:
 `plane_positions` for the stage, `acquisition_windows` for the clock. OME does not say
 whether a plane position is the centre of the field or its first pixel. This converter
@@ -77,7 +84,7 @@ def read_ome(tif: Any, file_name: str) -> Any:
     """
     from ome_types import from_xml
 
-    if not tif.is_ome or not tif.ome_metadata:
+    if not is_ome(tif):
         raise Unreadable(f"{file_name} is a TIFF without OME-XML, not an OME-TIFF.")
     try:
         ome = from_xml(tif.ome_metadata)
@@ -114,16 +121,23 @@ class OmeImage:
 
     `series` is None when the Image cannot be read from this file, and `problem` says
     why. The Image is then not converted, but it is reported.
+
+    `image` is None for a series of a TIFF without OME-XML (`plain_images`): there is
+    no OME record of it, and every fact read off one is then absent.
     """
 
-    #: Position in the OME document: what the dataset's source link names.
+    #: Position in the OME document (in the file's series, for a plain TIFF): what the
+    #: dataset's source link names.
     index: int
-    image: Any
+    image: Any | None
     series: Any | None
     problem: str | None = None
     #: For a generic series (`describes`): how its page axis ``I`` unfolds into OME's
     #: T, C and Z, slowest first. None for an OME series, which tifffile already shaped.
     split: tuple[tuple[str, int], ...] | None = None
+    #: What a plain TIFF's header says of its pixel size (`imagej_calibration`); an OME
+    #: Image's is read off its Pixels instead.
+    header_calibration: Calibration | None = None
 
     @property
     def sizes(self) -> dict[str, int]:
@@ -141,10 +155,14 @@ class OmeImage:
 
     @property
     def name(self) -> str | None:
+        if self.image is None:
+            return text_of(getattr(self.series, "name", None))
         return text_of(self.image.name)
 
     @property
     def id(self) -> str:
+        if self.image is None:
+            return f"Series:{self.index}"
         return text_of(self.image.id) or f"Image:{self.index}"
 
 
@@ -300,6 +318,92 @@ def match_series(tif: Any, ome: Any, file_name: str) -> list[OmeImage]:
 
 
 # ---------------------------------------------------------------------------
+# A TIFF without OME-XML
+# ---------------------------------------------------------------------------
+
+# How ImageJ spells a length unit, where it is not already OME's symbol. ImageJ writes
+# non-ASCII as an escape, so its micrometer arrives as six characters.
+IMAGEJ_UNITS: dict[str, str] = {
+    "\\u00B5m": "µm",
+    "\\u00b5m": "µm",
+    "μm": "µm",  # Greek mu, not the micro sign
+    "microns": "µm",
+    "micrometers": "µm",
+}
+
+
+def is_ome(tif: Any) -> bool:
+    """Whether the file carries OME-XML, and so is read as an OME-TIFF (`read_ome`)."""
+    return bool(tif.is_ome and tif.ome_metadata)
+
+
+def imagej_calibration(tif: Any, series: Any) -> Calibration | None:
+    """The pixel size ImageJ states for its own series, or None.
+
+    Only an ImageJ series, and only in a unit that is a length: ImageJ writes its scale
+    as the resolution tags in pixels per its ``unit``, and ``spacing`` for z. Without a
+    ``unit`` (or with ``pixel``) it is uncalibrated, whatever the tags hold.
+    """
+    if getattr(series, "kind", None) != "imagej":
+        return None
+    metadata = tif.imagej_metadata or {}
+    unit = str(metadata.get("unit") or "").strip()
+    symbol = IMAGEJ_UNITS.get(unit, unit)
+    if to_micrometer(1.0, symbol) is None or not symbol:
+        return None
+    x_res, y_res = series.keyframe.resolution
+
+    def size(per_unit: Any) -> float | None:
+        per_unit = float(per_unit or 0)
+        return to_micrometer(1.0 / per_unit, symbol) if per_unit > 0 else None
+
+    spacing = metadata.get("spacing")
+    z_um = to_micrometer(float(spacing), symbol) if spacing else None
+    return Calibration(size(x_res), size(y_res), z_um)
+
+
+def plain_images(tif: Any, file_name: str) -> list[OmeImage]:
+    """Every series of a TIFF that carries no OME-XML, as an image of its own.
+
+    tifffile's series are what the file holds: one per page shape for a plain multi-page
+    file, a hyperstack for ImageJ, a pyramid (read at its base) and its label for a
+    slide scanner. Its axes are tifffile's. Where it cannot tell what a run of pages is
+    (``I``, ``Q``) the axis is kept unnamed rather than guessed to be z, t or c.
+    """
+    out: list[OmeImage] = []
+    for index, series in enumerate(tif.series):
+        problem = None
+        if missing := missing_planes(series):
+            problem = f"{missing} of its planes are not in the file"
+        out.append(
+            OmeImage(
+                index,
+                None,
+                None if problem else series,
+                problem,
+                header_calibration=imagej_calibration(tif, series),
+            )
+        )
+    if not out:
+        raise Unreadable(f"tifffile found no image in {file_name}.")
+    return out
+
+
+def read_images(tif: Any, file_name: str) -> tuple[Any | None, list[OmeImage]]:
+    """The OME document of an open `tif` (None for a plain TIFF) and its images.
+
+    A file with OME-XML is read as an OME-TIFF, and refused as one where it cannot be:
+    a ``BinaryOnly`` file without its companion is not a plain TIFF. Only a file with no
+    OME-XML at all is read series by series (`plain_images`).
+    """
+    if is_ome(tif):
+        ome = read_ome(tif, file_name)
+        return ome, match_series(tif, ome, file_name)
+    logger.info("%s carries no OME-XML; reading it as a plain TIFF", file_name)
+    return None, plain_images(tif, file_name)
+
+
+# ---------------------------------------------------------------------------
 # Calibration and placement
 # ---------------------------------------------------------------------------
 
@@ -314,7 +418,9 @@ class Calibration:
     z_um: float | None
 
 
-def read_calibration(image: Any) -> Calibration:
+def read_calibration(image: Any | None) -> Calibration:
+    if image is None:
+        return Calibration(None, None, None)
     pixels = image.pixels
     return Calibration(
         to_micrometer(pixels.physical_size_x, pixels.physical_size_x_unit),
@@ -355,7 +461,7 @@ def plane_positions(image: Any) -> PlanePositions:
     A position in OME's default unit, ``reference frame``, is not a length, and reads as
     absent. That is the common case, and it leaves the image out of the shared world.
     """
-    planes = list(image.pixels.planes)
+    planes = list(image.pixels.planes) if image is not None else []
     if not planes:
         return PlanePositions(None, None, None, None)
 

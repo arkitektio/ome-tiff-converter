@@ -1,7 +1,12 @@
 # ome-tiff-converter
 
+<!-- arkitekt:badge -->
+<!-- The release workflow puts the 'Open in Arkitekt' badge here on its first run. -->
+<!-- /arkitekt:badge -->
+
 Converts OME-TIFF files into mikro datasets **natively**: no Bio-Formats, no JVM. One
-pyramided `ArrayDataset` per OME Image.
+pyramided `ArrayDataset` per OME Image. Plain TIFFs without OME-XML convert too (see
+[Plain TIFFs](#plain-tiffs)).
 
 It is the sibling of `nd2-converter`, `lif-converter` and `ome-converter`, with the same
 output contract. It reads the pixels with [tifffile](https://pypi.org/project/tifffile/)
@@ -30,6 +35,26 @@ and the OME-XML with [ome-types](https://pypi.org/project/ome-types/):
 - **Tuned pyramids.** `levels=0` (the default) halves until the coarsest level is
   ≤ 512 px.
 
+## Plain TIFFs
+
+A TIFF with no OME-XML at all is converted too, as one dataset per tifffile series: a
+plain image, a multi-page file, an ImageJ hyperstack, or a slide scanner's pyramid (read at
+its base) and its label. Only what the header says is recorded, and nothing is invented:
+
+- **Axes** are tifffile's. A run of pages it cannot name (`I` in a multi-page file, `Q` in
+  a shaped one) is kept as an `INDEX` axis. It is not guessed to be z, t or c.
+- **Calibration** is read only from ImageJ, and only when its `unit` is a length: the
+  resolution tags give x/y, and `spacing` gives z. A baseline `XResolution` is a print
+  resolution and is not read, because 72 dpi would claim 353 µm pixels. An uncalibrated
+  series is staged in its own pixel grid. A calibrated one goes in a micrometer space of
+  its own.
+- **Placement**: never. A plain TIFF records no stage position.
+- **The record**: the image anchor carries no OME metadata. Its `acquisition` device names
+  the source file, the series (`Series:<n>`, also the dataset's source link), tifffile's
+  series kind and axes, the pixel type and the sizes.
+- **Channels** are named `Channel <n>` (`Red`/`Green`/`Blue` for an 8-bit RGB pixel) and
+  are coloured from the palette.
+
 ## What is refused
 
 The converter is handed one file. It refuses what it cannot read faithfully from that file
@@ -37,7 +62,7 @@ rather than upload something else:
 
 | The file | What happens |
 |---|---|
-| A TIFF with no OME-XML | Refused: it is not an OME-TIFF. |
+| A TIFF with OME-XML that cannot be read faithfully | Refused as an OME-TIFF (below). It never falls back to being read as a plain TIFF. |
 | `BinaryOnly`: the pixels of a multi-file set, with the metadata in a `.companion.ome` | Refused, naming the companion. |
 | An Image that keeps planes in another file of a multi-file set (TiffData `UUID FileName=…`) | That Image is skipped and reported; the others convert. |
 | An Image some of whose planes are not in the file | Skipped. tifffile would fill them with zeros, which would then be uploaded as `IDENTICAL` to the file. |
@@ -85,8 +110,8 @@ Image (`C` × `S`) become one dataset each, and they share their Image's scene.
 ## The action
 
 **Convert OME-TIFF file to Datasets** (`convert_ome_tiff_file_to_datasets`) takes a mikro
-`File` (`.tif`, `.tiff`, `.tf2`, `.tf8` or `.btf`; whether it is an OME-TIFF is decided
-by its content), plus `levels` (0 = auto), `method`, `stage_scene`, `world_name` and
+`File` (`.tif`, `.tiff`, `.tf2`, `.tf8` or `.btf`; whether it is an OME-TIFF or a plain TIFF
+is decided by its content), plus `levels` (0 = auto), `method`, `stage_scene`, `world_name` and
 `snapshot`. `snapshot` is on by default: each staged scene gets a maximum projection of
 its layers as its snapshot, and each staged scene is set as the default scene of every
 dataset in it. The action returns the datasets it made. If one image fails, it is logged
@@ -96,7 +121,7 @@ and the rest still convert.
 
 ```sh
 uv run pytest                                      # offline: no server; OME-TIFFs written by tifffile
-OME_TIFF_SAMPLES=~/ome-tiff-samples uv run pytest  # also read every TIFF under that directory
+OME_TIFF_SAMPLES=~/ome-tiff-samples uv run pytest  # also read every TIFF (OME or plain) under that directory
 uv run arkitekt check
 uv run arkitekt plugin build -p linux/amd64
 ```

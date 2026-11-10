@@ -21,6 +21,7 @@ from ome_tiff import (
     match_series,
     plane_positions,
     read_calibration,
+    read_images,
     read_ome,
 )
 
@@ -151,11 +152,15 @@ def test_a_compressed_file_decodes(tmp_path):
         np.testing.assert_array_equal(np.asarray(M.series_array(image.series)), data)
 
 
-def test_a_plain_tiff_is_refused(tmp_path):
+def test_a_plain_tiff_has_no_ome_document(tmp_path):
     path = str(tmp_path / "plain.tif")
     tifffile.imwrite(path, np.zeros((8, 8), np.uint8))
-    with tifffile.TiffFile(path) as tif, pytest.raises(Unreadable, match="without OME-XML"):
-        read_ome(tif, "plain.tif")
+    with tifffile.TiffFile(path) as tif:
+        with pytest.raises(Unreadable, match="without OME-XML"):
+            read_ome(tif, "plain.tif")
+        ome, [item] = read_images(tif, "plain.tif")
+    assert ome is None
+    assert item.image is None and item.id == "Series:0"
 
 
 def test_a_binary_only_file_is_refused(tmp_path):
@@ -493,3 +498,125 @@ def test_a_big_endian_file_uploads_its_values(tmp_path, monkeypatch):
     [dataset], _, _ = run_action(tmp_path / "scratch", monkeypatch, path)
     np.testing.assert_array_equal(dataset.data, data)
     assert dataset.data.dtype.isnative
+
+
+# ---------------------------------------------------------------------------
+# TIFFs without OME-XML
+# ---------------------------------------------------------------------------
+
+
+def test_a_plain_greyscale_tiff_converts_uncalibrated(tmp_path, monkeypatch):
+    data = np.random.default_rng(10).integers(0, 4000, (32, 48), dtype=np.uint16)
+    source = str(tmp_path / "plain.tif")
+    tifffile.imwrite(source, data)
+    (tmp_path / "scratch").mkdir()
+    [dataset], mikro, registered = run_action(tmp_path / "scratch", monkeypatch, source)
+
+    assert dataset.name == "plain.tif"
+    np.testing.assert_array_equal(dataset.data, data[None])
+    assert registered == []
+    [source_file] = dataset.source_files
+    assert source_file.series_identifier == "Series:0"
+    image_anchor = dataset.anchors[0]
+    assert image_anchor.ome_metadata is None
+    assert [a.label.label for a in dataset.anchors if a.label is not None] == ["Channel 0"]
+    assert sum(1 for name, _ in mikro.calls if name == "create_intensity_layer") == 1
+    assert sum(1 for name, _ in mikro.calls if name == "create_scene_snapshot") == 1
+
+
+def test_a_plain_rgb_tiff_is_one_rgb_layer(tmp_path, monkeypatch):
+    photo = np.random.default_rng(11).integers(0, 255, (24, 16, 3), dtype=np.uint8)
+    source = str(tmp_path / "photo.tif")
+    tifffile.imwrite(source, photo, photometric="rgb")
+    (tmp_path / "scratch").mkdir()
+    [dataset], mikro, _ = run_action(tmp_path / "scratch", monkeypatch, source)
+
+    np.testing.assert_array_equal(dataset.data, np.moveaxis(photo, -1, 0))
+    assert sum(1 for name, _ in mikro.calls if name == "create_rgb_layer") == 1
+
+
+def test_plain_pages_stay_an_unnamed_axis(tmp_path, monkeypatch):
+    pages = np.random.default_rng(12).integers(0, 4000, (5, 16, 16), dtype=np.uint16)
+    source = str(tmp_path / "pages.tif")
+    with tifffile.TiffWriter(source) as writer:
+        for page in pages:
+            writer.write(page, metadata=None)
+    (tmp_path / "scratch").mkdir()
+    [dataset], mikro, _ = run_action(tmp_path / "scratch", monkeypatch, source)
+
+    # Five pages could be z, t or channels: the file does not say, so neither does this.
+    assert "I" in dataset.axis_names and not {"z", "t"} & set(dataset.axis_names)
+    flat = np.moveaxis(dataset.data, dataset.axis_names.index("I"), 0).reshape(5, 16, 16)
+    np.testing.assert_array_equal(flat, pages)
+    assert sum(1 for name, _ in mikro.calls if name == "create_volume_layer") == 0
+
+
+def test_every_series_of_a_plain_tiff_converts(tmp_path, monkeypatch):
+    grey = np.random.default_rng(13).integers(0, 4000, (16, 16), dtype=np.uint16)
+    photo = np.random.default_rng(14).integers(0, 255, (8, 8, 3), dtype=np.uint8)
+    source = str(tmp_path / "two.tif")
+    with tifffile.TiffWriter(source) as writer:
+        writer.write(grey, metadata=None)
+        writer.write(photo, metadata=None, photometric="rgb")
+    (tmp_path / "scratch").mkdir()
+    returned, mikro, _ = run_action(tmp_path / "scratch", monkeypatch, source)
+
+    assert [d.name for d in returned] == ["two.tif - image 1", "two.tif - image 2"]
+    np.testing.assert_array_equal(returned[0].data, grey[None])
+    np.testing.assert_array_equal(returned[1].data, np.moveaxis(photo, -1, 0))
+    assert [kw["name"] for name, kw in mikro.calls if name == "create_scene"] == [
+        "two.tif - image 1", "two.tif - image 2"
+    ]
+
+
+def test_a_print_resolution_is_not_a_calibration(tmp_path, monkeypatch):
+    source = str(tmp_path / "scan.tif")
+    tifffile.imwrite(
+        source, np.zeros((16, 16), np.uint8), resolution=(300, 300), resolutionunit="INCH"
+    )
+    (tmp_path / "scratch").mkdir()
+    [dataset], mikro, registered = run_action(tmp_path / "scratch", monkeypatch, source)
+
+    assert registered == []
+    [scene] = [kw for name, kw in mikro.calls if name == "create_scene"]
+    assert scene["coordinate_system"] == dataset.intrinsic_system.id
+
+
+@pytest.mark.parametrize("unit", ["um", "micron", "\\u00B5m"])
+def test_an_imagej_calibration_is_read(tmp_path, monkeypatch, unit):
+    stack = np.random.default_rng(15).integers(0, 4000, (3, 2, 16, 16), dtype=np.uint16)
+    source = str(tmp_path / "hyperstack.tif")
+    tifffile.imwrite(
+        source,
+        stack,
+        imagej=True,
+        resolution=(1 / 0.25, 1 / 0.25),
+        metadata={"axes": "ZCYX", "unit": unit, "spacing": 2.0},
+    )
+    (tmp_path / "scratch").mkdir()
+    [dataset], mikro, registered = run_action(tmp_path / "scratch", monkeypatch, source)
+
+    np.testing.assert_array_equal(dataset.data, np.moveaxis(stack, 1, 0))
+    # Calibrated, but nothing says where: a micrometer space of its own.
+    [(space, _, scale, offsets)] = registered
+    assert space == "hyperstack.tif (micrometers)" and offsets == {}
+    assert scale == pytest.approx({"z": 2.0, "y": 0.25, "x": 0.25})
+    assert sum(1 for name, _ in mikro.calls if name == "create_volume_layer") == 2
+
+
+def test_an_imagej_file_in_pixels_is_uncalibrated(tmp_path, monkeypatch):
+    source = str(tmp_path / "pixels.tif")
+    tifffile.imwrite(source, np.zeros((16, 16), np.uint16), imagej=True, resolution=(2, 2))
+    (tmp_path / "scratch").mkdir()
+    _, _, registered = run_action(tmp_path / "scratch", monkeypatch, source)
+    assert registered == []
+
+
+def test_a_bilevel_tiff_converts_as_zeros_and_ones(tmp_path, monkeypatch):
+    mask = np.random.default_rng(16).random((16, 16)) > 0.5
+    source = str(tmp_path / "mask.tif")
+    tifffile.imwrite(source, mask)
+    (tmp_path / "scratch").mkdir()
+    [dataset], _, _ = run_action(tmp_path / "scratch", monkeypatch, source)
+    assert dataset.data.dtype == np.uint8
+    np.testing.assert_array_equal(dataset.data, mask[None].astype(np.uint8))

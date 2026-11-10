@@ -1,5 +1,9 @@
 """Convert an OME-TIFF into one ``ArrayDataset`` per OME Image.
 
+A TIFF with no OME-XML is converted too, one dataset per tifffile series, with only what
+its header says: its shape, its pixel type, and an ImageJ calibration where there is one
+(`ome_tiff.plain_images`). It is not placed, and its channels are not named.
+
 The same contract as the ND2, LIF and OME converters, read natively: no Bio-Formats and
 no JVM. tifffile reads each plane (or tile) out of the file on demand, so the pixels are
 never decoded into RAM or copied to a scratch store before upload, and ome-types reads
@@ -41,15 +45,13 @@ import tempfile
 import zlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
 import numpy as np
 import xarray as xr
-
-from arkitekt import App, Task, run
+from arkitekt import App, DescriptorOperator, Requires, Task, run
 from mikro import Mikro, build_pyramid, canonical, mikro_service, scales_from, space_3d
 from mikro.api.schema import (
-    PlacementValidity,
     AcquisitionWindowInput,
     ArrayDataset,
     AxisAnchorInput,
@@ -61,6 +63,7 @@ from mikro.api.schema import (
     LabelInput,
     OmeMetadataInput,
     OptikitStateInput,
+    PlacementValidity,
     PreferredView,
     ProjectionMode,
     Scene,
@@ -69,6 +72,7 @@ from mikro.api.schema import (
     ValueHistogramInput,
     ValueRelation,
 )
+from mikro.arkitekt.specs import EXTENSION
 from mikro.inputs.render import (
     RGB_PRIMARIES,
     color_for_wavelength,
@@ -102,10 +106,9 @@ from ome_tiff import (
     Window,
     acquisition_windows,
     image_footprint,
-    match_series,
     plane_positions,
     read_calibration,
-    read_ome,
+    read_images,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,7 +122,7 @@ app = App(
     description=(
         "Converts OME-TIFF files into mikro datasets natively, one per OME Image, with "
         "their OME metadata: channels, instrument, light path, stage positions and "
-        "plane times."
+        "plane times. Plain TIFFs without OME-XML convert too, one dataset per series."
     ),
     author="jhnnsrs",
 )
@@ -621,6 +624,55 @@ def series_optikit(
     if stage is None and temperature is None and not state_devices:
         return None
     return OptikitStateInput(stage=stage, temperature=temperature, devices=state_devices)
+
+
+def plain_optikit(
+    file: File,
+    item: OmeImage,
+    calibration: Calibration,
+    data: xr.DataArray,
+    scale_note: str | None,
+) -> OptikitStateInput | None:
+    """The record of a series of a TIFF without OME-XML: where it came from and what its
+    header says, and nothing about an instrument it does not name."""
+    series = item.series
+    state_devices = devices(
+        device(
+            "acquisition",
+            "software",
+            setting("source-file", string=file.name),
+            setting("source-file-id", string=str(file.id)),
+            setting("image-index", number=float(item.index)),
+            setting("image-id", string=item.id),
+            setting("image-name", string=item.name),
+            setting("tiff-series-kind", string=text(getattr(series, "kind", None))),
+            setting("tiff-axes", string=text(getattr(series, "axes", None))),
+            setting("pixel-type", string=str(data.dtype)),
+            setting(
+                "stored-pixel-type",
+                string=str(series.dtype) if series.dtype != data.dtype else None,
+            ),
+            *(setting(f"size-{axis}", number=float(size)) for axis, size in data.sizes.items()),
+            setting(
+                "physical-size-x",
+                quantity=f"{calibration.x_um:g} um" if calibration.x_um is not None else None,
+            ),
+            setting(
+                "physical-size-y",
+                quantity=f"{calibration.y_um:g} um" if calibration.y_um is not None else None,
+            ),
+            setting(
+                "physical-size-z",
+                quantity=f"{calibration.z_um:g} um"
+                if calibration.z_um is not None and "z" in data.dims
+                else None,
+            ),
+            setting("scale-note", string=scale_note),
+        ),
+    )
+    if not state_devices:
+        return None
+    return OptikitStateInput(devices=state_devices)
 
 
 def channel_label(channel: Any | None, index: int, implicit_rgb: bool) -> str:
@@ -1359,7 +1411,7 @@ def layers_of(sizes: Mapping[str, int], dtype: Any) -> int:
 
 def plan_image(item: OmeImage) -> Planned:
     sizes = item.sizes
-    calibration = read_calibration(item.image)
+    calibration = item.header_calibration or read_calibration(item.image)
     positions = plane_positions(item.image)
     rgb_channels: list[int | None] = [None]
     if "S" in sizes and "C" in sizes:
@@ -1386,7 +1438,8 @@ class FileContext:
     """What every image of one file shares: read once, before the first upload."""
 
     file: File
-    ome: Any
+    #: None for a TIFF without OME-XML.
+    ome: Any | None
     world: Any
     levels: int
     method: str
@@ -1423,6 +1476,10 @@ def convert_image(
     # Canonical order — time, then channel, then space — is load-bearing: the render
     # axes are derived from the *position* of the spatial axes.
     data = canonical(array, types=extra_types)
+    if data.dtype == np.bool_:
+        # A bilevel TIFF (a mask, a scan) reads as bool, which no histogram, contrast
+        # window or pyramid takes. 0 and 1 in eight bits are the same values.
+        data = data.astype(np.uint8)
     dims = [str(d) for d in data.dims]
 
     implicit_rgb = packs_one_pixel(packed_samples, data.sizes["c"], data.dtype)
@@ -1442,11 +1499,17 @@ def convert_image(
     scales = scales_from(pyramid, context.method)
 
     scale, scale_note = voxel_scale(planned.calibration, dims)
-    whole_window, timepoint_windows, time_note = acquisition_windows(
-        image, data.sizes.get("t", 1)
+    whole_window, timepoint_windows, time_note = (
+        acquisition_windows(image, data.sizes.get("t", 1))
+        if image is not None
+        else (None, [], None)
     )
 
-    channels = ome_channels(image, data.sizes["c"], packed_samples, rgb_channel)
+    channels = (
+        ome_channels(image, data.sizes["c"], packed_samples, rgb_channel)
+        if image is not None
+        else []
+    )
     specs = channel_specs(data, pyramid, channels, packed_samples, is_volume)
 
     name = file.name
@@ -1461,16 +1524,23 @@ def convert_image(
     if rgb_channel is not None:
         series_identifier += f":C{rgb_channel}"
 
-    image_anchor = CoordinateAnchorInput(
-        axis_anchors=(),
-        acquisition_window=acquisition_window(whole_window),
-        ome_metadata=OmeMetadataInput(
-            metadata_string=image_record(file, item, instrument, rgb_channel)
-        ),
-        microscope=series_optikit(
-            file, item, instrument, positions, data, scale_note, time_note
-        ),
-    )
+    if image is None:
+        # A plain TIFF: there is no OME record to carry, only what its header says.
+        image_anchor = CoordinateAnchorInput(
+            axis_anchors=(),
+            microscope=plain_optikit(file, item, planned.calibration, data, scale_note),
+        )
+    else:
+        image_anchor = CoordinateAnchorInput(
+            axis_anchors=(),
+            acquisition_window=acquisition_window(whole_window),
+            ome_metadata=OmeMetadataInput(
+                metadata_string=image_record(file, item, instrument, rgb_channel)
+            ),
+            microscope=series_optikit(
+                file, item, instrument, positions, data, scale_note, time_note
+            ),
+        )
 
     dataset = mikro.create_array_dataset(
         data=pyramid[0],
@@ -1617,13 +1687,15 @@ def preview_sides(groups: Sequence[Sequence[int]]) -> dict[int, int]:
         "objective and plane times, placed in a shared micrometer space at its stage "
         "position where the file records it along every axis (otherwise in a calibrated "
         "space of its own), and staged in a scene — one mosaic for images whose fields "
-        "touch — with a maximum projection as its snapshot."
+        "touch — with a maximum projection as its snapshot. A plain TIFF without "
+        "OME-XML converts as one dataset per series, uncalibrated unless ImageJ "
+        "calibrated it."
     ),
     collections=["conversion"],
     logo=logo_of("convert_ome_tiff_file_to_datasets"),
 )
 def convert_ome_tiff_file_to_datasets(
-    file: File,
+    file: Annotated[File, Requires(key=EXTENSION, operator=DescriptorOperator.IN, value=["tif", "tiff", "ome.tif", "ome.tiff", "btf", "ome.btf", "tf2", "tf8"])],
     mikro: Mikro,
     task: Task,
     levels: int = 0,
@@ -1632,7 +1704,8 @@ def convert_ome_tiff_file_to_datasets(
     world_name: str = "",
     snapshot: bool = True,
 ) -> list[ArrayDataset]:
-    """Convert every OME Image of an OME-TIFF into a dataset.
+    """Convert every OME Image of an OME-TIFF into a dataset, or every series of a
+    plain TIFF without OME-XML.
 
     `levels` of 0 picks the pyramid depth per image (`auto_levels`). Returns a list
     rather than yielding: a mosaic scene is composed after its last image, and an
@@ -1652,13 +1725,12 @@ def convert_ome_tiff_file_to_datasets(
 
     try:
         path = file.store.download(os.path.join(workdir, os.path.basename(file.name)))
-        task.progress(5, "Reading the OME-XML")
+        task.progress(5, "Reading the header")
 
         import tifffile
 
         with tifffile.TiffFile(path) as tif:
-            ome = read_ome(tif, file.name)
-            images = match_series(tif, ome, file.name)
+            ome, images = read_images(tif, file.name)
             failures: list[tuple[str, Exception]] = [
                 (item.id, Unreadable(f"{item.id}: {item.problem}"))
                 for item in images

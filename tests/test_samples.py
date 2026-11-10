@@ -4,8 +4,8 @@ Skipped unless ``OME_TIFF_SAMPLES`` names a directory of them:
 
     OME_TIFF_SAMPLES=~/ome-tiff-samples uv run pytest
 
-Every ``.tif``/``.tiff`` under it is read as the action would read it, header and
-pairing first, then a corner of every image's pixels. A file the converter refuses must
+Every ``.tif``/``.tiff`` under it, with OME-XML or without, is read as the action would
+read it, header and pairing first, then a corner of every image's pixels. A file the converter refuses must
 be refused with `Unreadable`, a reason it can give, rather than with anything else.
 """
 
@@ -17,7 +17,7 @@ import pytest
 import tifffile
 
 import app as M
-from ome_tiff import Unreadable, match_series, read_ome
+from ome_tiff import Unreadable, read_images
 
 ROOT = os.environ.get("OME_TIFF_SAMPLES")
 SAMPLES = (
@@ -36,8 +36,7 @@ pytestmark = [
 def test_a_sample_is_read_or_refused_with_a_reason(path):
     with tifffile.TiffFile(path) as tif:
         try:
-            ome = read_ome(tif, path.name)
-            images = match_series(tif, ome, path.name)
+            _, images = read_images(tif, path.name)
         except Unreadable:
             return
         for item in images:
