@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.1.2 (2026-11-15)
+
+### Bug Fixes
+
+- **deps**: Arkitekt 17 and arkitekt-spec 11
+  ([`3e84d69`](https://github.com/arkitektio/ome-tiff-converter/commit/3e84d69cd73b82bda11f1b1e73b9621fa01c55d2))
+
+
 ## v0.1.1 (2026-11-15)
 
 ### Bug Fixes
