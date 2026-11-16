@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.1.3 (2026-11-16)
+
+### Bug Fixes
+
+- Bloks are self-contained <Blok kind context> trees
+  ([`7368489`](https://github.com/arkitektio/ome-tiff-converter/commit/73684896712b38eb9500b2c946cb19e111a11787))
+
+### Build System
+
+- Lock arkitekt 18
+  ([`c65405f`](https://github.com/arkitektio/ome-tiff-converter/commit/c65405f873141e0ee3e79110b33ff651231cc8a0))
+
+
 ## v0.1.2 (2026-11-15)
 
 ### Bug Fixes
