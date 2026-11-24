@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.1.4 (2026-11-24)
+
+### Bug Fixes
+
+- Build on arkitekt 18.5.2, rekuest 18, arkitekt-spec 13 and mikro 14.2
+  ([`90b1f87`](https://github.com/arkitektio/ome-tiff-converter/commit/90b1f879c9553c511ce6258715e3e4f4cefb8dc1))
+
+
 ## v0.1.3 (2026-11-16)
 
 ### Bug Fixes
