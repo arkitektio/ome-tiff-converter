@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.1.5 (2026-11-25)
+
+### Bug Fixes
+
+- Runs on arkitekt 19
+  ([`255e8d1`](https://github.com/arkitektio/ome-tiff-converter/commit/255e8d14dd606d1d081a31e796d113d3774b199c))
+
+
 ## v0.1.4 (2026-11-24)
 
 ### Bug Fixes
